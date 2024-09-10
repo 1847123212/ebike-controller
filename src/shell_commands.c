@@ -8,12 +8,16 @@
 #include "board.h"
 #include "shell_commands.h"
 #include "motor_control.h"
+#include "dcdc_control.h"
 #include "motor_orientation.h"
 #include "motor_sampling.h"
-#include <ff.h>
 #include "sensor_task.h"
 #include "bike_control_task.h"
 #include "motor_limits.h"
+#include "wheel_speed.h"
+#include "settings.h"
+#include "filesystem.h"
+#include "log_task.h"
 
 static void cmd_mem(BaseSequentialStream *chp, int argc, char *argv[]) {
     size_t n, size;
@@ -132,33 +136,89 @@ static void cmd_motor_rotate(BaseSequentialStream *chp, int argc, char *argv[])
                angle, motor_orientation_get_angle(), motor_orientation_get_fast_rpm(), motor_orientation_get_hall_angle());
     chSequentialStreamWrite(chp, (void*)buf, strlen(buf));
   } while (argc > 0 && b != Q_RESET && b != '\r');
+
+  motor_stop();
 }
 
 static void cmd_motor_run(BaseSequentialStream *chp, int argc, char *argv[])
 {
-  if (argc < 2)
+  if (argc < 1)
   {
-    chprintf(chp, "Usage: motor_run <torque_mA> <advance_deg>\r\n");
+    chprintf(chp, "Usage: motor_run rpm [torque_mA] [advance_deg]\r\n");
     return;
   }
+
+  int target_rpm = atoi(argv[0]);
+  int torque_mA = 1000;
+  int advance = 0;
+
+  if (argc >= 2)
+  {
+    torque_mA = atoi(argv[1]);
+  }
+
+  if (argc >= 3)
+  {
+    advance = atoi(argv[2]);
+  }
   
-  int torque_mA = atoi(argv[0]);
-  int advance = atoi(argv[1]);
-  
+  chprintf(chp, "Running at %d RPM, using max %d mA torque current\r\n", target_rpm, torque_mA);
+
+  // Start with max current
   motor_run(torque_mA, advance);
+
+  // PID controller to maintain speed
+  float prev_error = 0.0f;
+  float error_I = 0.0f;
+  float cP = 0.2f;
+  float cI = 0.02f;
+  float cD = 0.1f;
+
+  if (argc >= 6)
+  {
+    cP = atoi(argv[3]) / 100.0f;
+    cI = atoi(argv[4]) / 100.0f;
+    cD = atoi(argv[5]) / 100.0f;
+  }
   
   int b = 0;
   int i = 0;
+  
+  systime_t start = chVTGetSystemTime();
+
+  uint32_t cnt = 0;
   do {
     // End if enter is pressed
-    b = chnGetTimeout((BaseChannel*)chp, MS2ST(100));    
+    b = chnGetTimeout((BaseChannel*)chp, MS2ST(10));
+    cnt++;
     
-    chprintf(chp, "%6d %6d RPM, %6d mV, %6d mA, %6d Tmotor, %6d Tmosfet, %d ticks\r\n",
-             i++, motor_orientation_get_fast_rpm(), get_battery_voltage_mV(), get_battery_current_mA(),
-             get_motor_temperature_mC() / 1000, get_mosfet_temperature_mC() / 1000,
-             motor_get_interrupt_time()
-            );
+    int rpm = motor_orientation_get_fast_rpm();
+
+    // Do PID control to maintain speed
+    
+    float error = target_rpm - rpm;
+    error_I += error * cI;
+    if (error_I < -torque_mA) error_I = -torque_mA;
+    if (error_I > torque_mA) error_I = torque_mA;
+    float current = cP * error + error_I + cD * (error - prev_error);
+    prev_error = error;
+    if (current > torque_mA) current = torque_mA;
+    if (current < -torque_mA) current = -torque_mA;
+    int current_mA = current;
+    motor_run(current_mA, advance);
+
+    if (cnt % 10 == 0)
+    {
+      chprintf(chp, "%6d ms, command %6d mA, %6d RPM, Battery: %6d mV, %6d mA, Tmosfet: %6d C, IrqTime: %d ticks\r\n",
+              chVTGetSystemTime() - start,
+              current_mA, rpm, get_battery_voltage_mV(), get_battery_current_mA(),
+              get_mosfet_temperature_mC() / 1000,
+              motor_get_interrupt_time()
+              );
+    }
   } while (argc > 0 && b != Q_RESET && b != '\r');
+
+  motor_stop();
 }
 
 static void cmd_motor_samples(BaseSequentialStream *chp, int argc, char *argv[])
@@ -166,54 +226,81 @@ static void cmd_motor_samples(BaseSequentialStream *chp, int argc, char *argv[])
   motor_sampling_print(chp);
 }
 
-static void cmd_ls(BaseSequentialStream *chp, int argc, char *argv[])
+static void cmd_dcdc_out(BaseSequentialStream *chp, int argc, char *argv[])
 {
-  DIR directory;
-  FILINFO file;
-  FRESULT status;
-  
-  status = f_opendir(&directory, "/");
-  
-  if (status != FR_OK)
+  if (argc < 2)
   {
-    chprintf(chp, "Failed to open SD card: %d\r\n", status);
+    chprintf(chp, "Usage: dcdc_out <voltage_mV> <current_mA>\r\n");
     return;
   }
-  
-  while ((status = f_readdir(&directory, &file)) == FR_OK
-         && file.fname[0] != '\0')
-  {
-    chprintf(chp, "%8ld %s\r\n", file.fsize, file.fname);
-  }
+
+  int mV = atoi(argv[0]);
+  int mA = atoi(argv[1]);
+
+  start_dcdc_control();
+  set_dcdc_mode(mV, mA);
 }
 
-static void cmd_cat(BaseSequentialStream *chp, int argc, char *argv[])
-{
+static void cmd_readlog(BaseSequentialStream *chp, int argc, char *argv[])
+{ 
   if (argc == 0)
   {
-    chprintf(chp, "usage: cat <file>\r\n");
+    chprintf(chp, "usage: readlog <num_sectors> [start_km]\r\n");
+    chprintf(chp, "sectors available: %d\r\n", (int)g_system_state.sd_log_sector);
     return;
   }
-  
-  FIL f;
-  FRESULT status;
-  status = f_open(&f, argv[0], FA_READ);
-  
-  if (status != FR_OK)
+
+  uint32_t num_sectors = atoi(argv[0]);
+  uint32_t start_sector = g_system_state.sd_log_sector;
+
+  if (argc == 1)
   {
-    chprintf(chp, "Failed to open file: %d\r\n", status);
-    return;
+    // Latest N sectors
+    if (num_sectors > start_sector) num_sectors = start_sector;
+    start_sector -= num_sectors;
   }
-  
-  char buf[128];
-  unsigned bytes_read;
-  while ((status = f_read(&f, buf, sizeof(buf), &bytes_read)) == FR_OK
-         && bytes_read > 0)
+  else
   {
-    chSequentialStreamWrite(chp, (void*)buf, bytes_read);
+    // N sectors starting at kilometer count Y
+    uint32_t start_km = atoi(argv[1]);
+    while (start_sector > 16)
+    {
+      eventlog_store_t entries[2];
+      int status = filesystem_read(start_sector, (uint8_t*)&entries, sizeof(entries));
+      if (status < 0 || entries[0].log.alltime_distance_m < start_km * 1000) break;
+
+      start_sector -= 16;
+    }
   }
-  
-  f_close(&f);
+
+  for (int i = 0; i < num_sectors; i++)
+  {
+    if (start_sector + i >= g_system_state.sd_log_sector) break;
+
+    eventlog_store_t entries[2];
+    int status = filesystem_read(start_sector + i, (uint8_t*)&entries, sizeof(entries));
+
+    if (status > 0)
+    {
+      if (i == 0)
+      {
+        chprintf(chp, "# Sector %d, systime %d ms, total distance %d m\n",
+          (int)start_sector, (int)entries[0].log.systime, (int)entries[0].log.alltime_distance_m);
+      }
+
+      for (int j = 0; j < 2; j++)
+      {
+        const uint8_t *p = (const uint8_t*)&entries[j];
+        for (int k = 0; k < sizeof(eventlog_t) / 4; k++)
+        {
+          chprintf(chp, "%02x%02x%02x%02x", p[0], p[1], p[2], p[3]);
+          p += 4;
+          chThdSleepMilliseconds(1);
+        }
+        chprintf(chp, "\n");
+      }
+    }
+  }
 }
 
 static void cmd_sensors(BaseSequentialStream *chp, int argc, char *argv[])
@@ -234,12 +321,19 @@ static void cmd_status(BaseSequentialStream *chp, int argc, char *argv[])
 {
   chprintf(chp, "Battery voltage:      %8d mV\r\n", get_battery_voltage_mV());
   chprintf(chp, "Battery current:      %8d mA\r\n", get_battery_current_mA());
-  chprintf(chp, "Motor temperature:    %8d mC\r\n", get_motor_temperature_mC());
   chprintf(chp, "Mosfet temperature:   %8d mC\r\n", get_mosfet_temperature_mC());
-  chprintf(chp, "Motor RPM:            %8d\r\n",    motor_orientation_get_rpm());
-  chprintf(chp, "Acceleration level:   %8d mg\r\n", bike_control_get_acceleration_level());
+  chprintf(chp, "Motor RPM:            %8d (sync: %d)\r\n",    motor_orientation_get_rpm(), (int)motor_orientation_in_sync());
+  chprintf(chp, "Wheel velocity:       %8d m/s\r\n", (int)wheel_speed_get_velocity());
+  chprintf(chp, "Wheel distance:       %8d m\r\n",  wheel_speed_get_distance());
+  chprintf(chp, "Acceleration:         %8d mg\r\n", bike_control_get_acceleration() / 10);
   chprintf(chp, "Motor target current: %8d mA\r\n", bike_control_get_motor_current());
-  chprintf(chp, "Motor max duty:       %8d\r\n",    motor_limits_get_max_duty());
+  chprintf(chp, "Motor max power:      %8d %%\r\n", (int)(motor_limits_get_fraction() * 100));
+  chprintf(chp, "Motor angle:          %8d deg, HALL %4d\r\n", motor_orientation_get_angle(), motor_orientation_get_hall_angle());
+  chprintf(chp, "Ctrl state:           %8s\r\n", bike_control_get_state());
+
+  int p1, p3;
+  motor_get_currents(&p1, &p3);
+  chprintf(chp, "Phase currents:       %8d mA, %8d mA\r\n", p1, p3);
 }
 
 static void cmd_i2c(BaseSequentialStream *chp, int argc, char *argv[])
@@ -301,11 +395,11 @@ const ShellCommand shell_commands[] = {
   {"motor_rotate", cmd_motor_rotate},
   {"motor_run", cmd_motor_run},
   {"motor_samples", cmd_motor_samples},
-  {"ls", cmd_ls},
-  {"cat", cmd_cat},
+  {"readlog", cmd_readlog},
   {"sensors", cmd_sensors},
   {"status", cmd_status},
   {"i2c", cmd_i2c},
   {"oled", cmd_oled},
+  {"dcdc_out", cmd_dcdc_out},
   {NULL, NULL}
 };

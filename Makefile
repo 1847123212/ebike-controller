@@ -6,30 +6,37 @@ PROJECT = ebike-controller
 BUILDDIR = build
 UINCDIR += src u8glib
 
-USE_OPT += -Os -g -gdwarf-2 -g3 -Wno-unused \
-        -fomit-frame-pointer -falign-functions=16 -std=gnu99 -ffast-math
+USE_OPT += -Os -g -gdwarf-2 -g3 -Wno-unused -Wno-deprecated \
+        -fomit-frame-pointer -falign-functions=16 -std=gnu11 -ffast-math -Wno-attributes -Wno-array-bounds
 
 # Bootloader
 PROJECT_CSRC += src/bootloader.c
-USE_OPT += -DCORTEX_VTOR_INIT=0x00004000
+USE_OPT += -DCORTEX_VTOR_INIT=0x00020000
 
 # Base system & bootup
-PROJECT_CSRC += src/main.c src/board.c src/debug.c
+PROJECT_CSRC += src/main.c src/board.c src/debug.c src/settings.c
 
 # Shell
 PROJECT_CSRC += src/usbcfg.c src/usb_usart.c src/bluetooth_usart.c src/shell_commands.c
+USE_OPT += -DSHELL_MAX_ARGUMENTS=6
 
 # Motor control
 PROJECT_CSRC += src/motor_control.c src/motor_orientation.c src/motor_sampling.c src/motor_limits.c
 
+# DCDC control
+PROJECT_CSRC += src/dcdc_control.c
+
 # Sensors
-PROJECT_CSRC += src/lsm6ds3.c src/sensor_task.c
+PROJECT_CSRC += src/lsm6ds3.c src/sensor_task.c src/wheel_speed.c
 
 # Filesystem and logging
 PROJECT_CSRC += src/filesystem.c src/log_task.c
 
 # Motion control
 PROJECT_CSRC += src/bike_control_task.c
+
+# WS2812 LED driver
+PROJECT_CSRC += src/ws2812.c
 
 # OLED screen
 PROJECT_CSRC += src/ui_task.c
@@ -59,8 +66,19 @@ debug:
 		-ex 'set *((uint32_t*)0xe0042004) = 0x07' $(BUILDDIR)/$(PROJECT).elf
 
 debugraw:
-	$(GDB) -iex 'target remote | $(OOCD) -d1 $(OOCDFLAGS) \
+	$(GDB) -iex 'target extended | $(OOCD) -d1 $(OOCDFLAGS) \
 		-c "gdb_port pipe"' -iex 'mon halt' -ex 'set *((uint32_t*)0xe0042004) = 0x07' $(BUILDDIR)/$(PROJECT).elf
+
+debug_orbtrace:
+	$(GDB) -iex 'target extended | $(OOCD) -d1 -f interface/cmsis-dap.cfg -f target/stm32f4x.cfg -c "stm32f4x.cpu configure -rtos auto;" \
+		-c "gdb_port pipe"' -iex 'mon halt' \
+		-ex 'set *((uint32_t*)0xe0042004) = 0x07' $(BUILDDIR)/$(PROJECT).elf
+
+$(BUILDDIR)/$(PROJECT).dfu: $(BUILDDIR)/$(PROJECT).hex
+	python dfuse-pack.py -i $< $@
+
+program_dfu: $(BUILDDIR)/$(PROJECT).dfu
+	dfu-util -a 0 -D $<
 
 %.o: %.c
     # Just to make kdevelop include path discovery work.
